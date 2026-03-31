@@ -101,15 +101,14 @@ def open_nc(url_or_path, variable=None, remote=True):
     -------
     data : xarray.Dataset
     """
-    if remote:
-        s3 = s3fs.S3FileSystem(anon=True, default_fill_cache=False, default_cache_type=None)
-        with s3.open(
-            url_or_path,
-        ) as f:
-            data = xr.open_dataset(f, engine="h5netcdf").load().squeeze()
-    else:
-        data = xr.open_dataset(url_or_path, engine="h5netcdf").load().squeeze()
-            
+    try:
+        if remote:
+            data = xr.open_dataset(url_or_path, engine="h5netcdf").load().squeeze()
+        else:
+            data = xr.open_dataset(url_or_path, engine="h5netcdf").load().squeeze()
+    except Exception as e:
+        print(f"Failed to open {url_or_path}: {e}")
+        return None
     return data
 
 
@@ -160,63 +159,96 @@ def get_shared_coordinates(list_of_xr_datasets):
     )
 
 
-def load_data_products(moorings=DEFAULT_MOORINGS, data_type="hourly-timeseries", pattern=None, data_dir=DATA_DIR):
-    """
-    Load data products from S3 buckets or locally.
+# +
+import os
+import xarray as xr
+import boto3
+from botocore import UNSIGNED
+from botocore.client import Config
 
-    Usage:
-        hourly_files, hourly_ds = utils.load_data_products()
-        agg_files, agg_ds = utils.load_data_products(data_type="aggregated_timeseries",
-                                                     pattern="*TEMP-aggregated-timeseries_*.nc")
+# Map moorings to their regions
+MOORING_REGIONS = {
+    "NRSKAI": "NRS",
+    "SAM8SG": "SA",
+    "SAM5CB": "SA",
+    "SAM2CP": "SA",
+    "SAM6IS": "SA",
+    "SAM3MS": "SA",
+    "SAM7DS": "SA"
+}
+
+def load_data_products(
+    moorings_list,
+    data_type="hourly_timeseries",
+    local_base="imos-data",
+    cache=True
+):
+    """
+    Load IMOS mooring data for a list of moorings from the S3 bucket.
 
     Parameters
     ----------
-    moorings : list
-        List of tuples (region, mooring_ID) to load.
+    moorings_list : list
+        List of mooring names (e.g., ["NRSKAI", "SAM8SG"]).
     data_type : str
-        Data type to load, e.g. "aggregated_timeseries", "hourly_timeseries".
-    pattern : str
-        Pattern to match the files.
+        Type of data folder (default "hourly_timeseries").
+    local_base : str
+        Local folder to store downloaded data.
+    cache : bool
+        Whether to save files locally.
+
+    Returns
+    -------
+    files_dict : dict
+        Paths to downloaded NetCDF files.
+    datasets_dict : dict
+        Loaded xarray Datasets.
     """
-    files, ds = dict(), dict()
+    files_dict = {}
+    datasets_dict = {}
 
-    if pattern is None:
-        pattern = f"*_{data_type}_*.nc"
+    # Ensure local folder exists
+    os.makedirs(local_base, exist_ok=True)
 
-    if not data_dir.endswith("/"):
-        data_dir = data_dir + "/"
+    # Connect to S3
+    s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
 
-    # Find file URLs on S3 or load local files
-    for region, mooring in moorings:
-        
-        # Check if file exists
-        glob_path = glob(f"{data_dir}/{region}/{mooring}/{pattern}")
-        local = len(glob_path) > 0
-        
-        # Retrieve from remote if they don't exist
-        if not local:
-            print(f"Downloading {data_type} for mooring '{mooring}'.")
-            path = f"s3://imos-data/IMOS/ANMN/{region}/{mooring}/{data_type.replace('-', '_')}/"
-            file_url = load_file_urls(path, pattern=f"{pattern}")[0]
-            files[mooring] = file_url        
-        # Load them locally if they exist
-        else:
-            print(f"Loading local {data_type} data for mooring '{mooring}'.")
-            file_url = glob_path[0]
-            files[mooring] = file_url
-        
-        outdir = Path(f"{data_dir}/{region}/{mooring}/")
-        if not outdir.exists():
-            Path.mkdir(outdir, parents=True)
-        outfile = Path(outdir).joinpath(file_url.split("/")[-1])
-        ds[mooring] = open_nc(str(outfile) if local else str(file_url), remote=not local)
-        
-        # Write files locally if they don't exist
-        if not local:
-            ds[mooring].to_netcdf(outfile)
-    
-    return files, ds
+    bucket = "imos-data"
 
+    for mooring in moorings_list:
+        region = MOORING_REGIONS.get(mooring)
+        if region is None:
+            print(f"Unknown mooring: {mooring}, skipping.")
+            continue
+
+        # Construct the filename (S3 standard naming)
+        filename = f"IMOS_ANMN-{region}_{mooring}_FV02_{data_type}_END-20240923_C-20250125.nc"
+        local_path = os.path.join(local_base, f"{region}_{mooring}_{filename}")
+
+        # Download if not cached
+        if not os.path.exists(local_path) or not cache:
+            try:
+                s3.download_file(bucket, f"IMOS/ANMN/{region}/{mooring}/{data_type}/{filename}", local_path)
+                print(f"Downloaded {mooring} from S3.")
+            except Exception as e:
+                print(f"Failed to download {mooring}: {e}")
+                continue
+
+        # Load dataset
+        try:
+            ds = xr.open_dataset(local_path)
+            datasets_dict[mooring] = ds
+            files_dict[mooring] = local_path
+        except Exception as e:
+            print(f"Failed to load {mooring}: {e}")
+
+    if not datasets_dict:
+        print("No datasets were loaded. Check your moorings or S3 paths.")
+
+    return files_dict, datasets_dict
+
+
+# -
 
 def extract_timeseries_df(ds: xr.Dataset, sigclip=5, save=False):
     """From the given hourly-timeseries Dataset, extract a timeseries of temperature
